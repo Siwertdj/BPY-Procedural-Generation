@@ -21,7 +21,12 @@ We created a heightmap as a template, then erroded this to create a more realist
 ```
 * Once installed, open the 'Scripting' tab in the Blender interface, then open the 'program.py' file.
 * Click 'Run', and the program will start to build. This may take a while, depending on the scale of your terrain.
+* You can adjust the value of 'n' (at the bottom of program.py) to create smaller or larger areas. 100-200 is the recommended range.
 
+## Known issues
+
+* Due to a deep-rooted bug, the program can only generate square terrain, and not rectangular.
+* The material corresponding to the heightmap may rotate unpredictably over the created model.
 
 ## Authors
 
