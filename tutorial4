@@ -1,0 +1,923 @@
+import bpy
+import bmesh
+import numpy as np
+import math
+import mathutils
+import random
+import sys
+import os
+from PIL import Image
+
+def clearScene():
+    #Ensure correct mode
+    if bpy.context.mode!= 'OBJECT':
+        # Set mode to Object mode
+        bpy.ops.object.mode_set(mode='OBJECT')
+        
+    # Deselect all objects
+    bpy.ops.object.select_all(action='DESELECT')
+
+    # Select and delete all objects
+    bpy.ops.object.select_by_type(type='MESH')
+    bpy.ops.object.delete()
+
+    # Remove any remaining data blocks
+    bpy.ops.outliner.orphans_purge()
+
+# Prepare the scene on load
+clearScene()
+
+# we use a heightap and then triangulate the points.
+# this function takes an  n x m  array of values (heights) 
+# ..and creates and displays a mesh of  n x m  size in blender with the points from A.
+# We assume the resolution is 1 per meter, and the heights are also in meters.
+def TerrainFromHeights(A, n, m):
+    # Create a mesh object
+    mesh = bpy.data.meshes.new('TerrainMesh')
+    obj = bpy.data.objects.new('TerrainObject', mesh)
+
+    # Link the object to the scene collection
+    scene = bpy.context.scene
+    collection = scene.collection
+    collection.objects.link(obj)
+
+    # Create vertices from the height data
+    # BUGNOTE: m an n switched here?
+    vertices = [(x, y, A[x][y]) for x in range(m) for y in range(n)]
+
+    # Create faces for the mesh
+    # BUGNOTE: m an n switched here?
+    faces = [(i*m+j, i*m+j+1, (i+1)*m+j+1, (i+1)*m+j) for i in range(m-1) for j in range(n-1)]
+
+    # Create the mesh
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    
+    '''
+    We created a little function that should create an image based on the heightmap, so that we
+    can give different colors to the mountains depending on the height.
+    If the package is not imported, it will ignore this and use a normal material.
+    The erosion doesnt stand out a lot when this is active though, but switching to
+    Solid viewport shading should make up for that.
+    Unfortunately, it does seem to rotate at random..
+    '''
+    if ('Image' in globals()):
+        image = CreateImage(A,n,m)
+        
+        bpy.context.view_layer.objects.active = obj     # select our current terrain object
+        bpy.ops.object.mode_set(mode='EDIT')            # go to edit mode
+        bpy.ops.mesh.select_all(action='SELECT')        # select all vertices
+        bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)   # unwrap the mesh
+        bpy.ops.uv.pack_islands(margin=0.001)
+        
+        # Import texture and prepare material
+        material = bpy.data.materials.new('TerrainMaterial')
+        material.use_nodes = True
+        nodes = material.node_tree.nodes
+        for node in nodes:
+            nodes.remove(node)
+        # Add nodes for image texture
+        tex_image = nodes.new(type='ShaderNodeTexImage')
+        tex_image.image = image
+        # Add nodes for UV mapping
+        uv_map = nodes.new(type='ShaderNodeUVMap')
+        uv_map.uv_map = 'UVMap'
+        principled_bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+        # Add Material Output
+        output_node = nodes.new(type='ShaderNodeOutputMaterial')
+        
+        # Connect nodes
+        links = material.node_tree.links
+        link = links.new(tex_image.outputs['Color'], output_node.inputs['Surface'])
+        link_uv = links.new(uv_map.outputs['UV'], tex_image.inputs['Vector'])
+        
+        obj.data.materials.append(material)
+        
+        # Return to default mode
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    else:  
+        obj.data.materials.append(bpy.data.materials.new(name="TerrainMaterial"))
+        material = obj.data.materials[0]
+        material.use_nodes = True
+        material.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (0.35, 0.22, 0.15, 1.0)
+        #material.node_tree.nodes["Principled BSDF"].inputs["Alpha"].default_value = 0.5
+        
+
+    
+# returns  n x m  array filled with 0's of type float
+def ZeroHeights(n,m):
+    return np.zeros((n,m), dtype=float)
+    
+# adds a single random bump to the terrain, according to the following parameters:
+##  - Choose a random point (x,y) within the range of the terrain ( 0 < x < n  && 0 < y < m )
+##  - Choose a random size s in the range (0, (n+m)/10)
+##  - For all entries in the array, adjust their height by adding a smooth bump of size s at the
+##    location at the location (x,y)
+###     o. For instance: add the following function to all points at distance d less than s from (x,y):
+###         s / pi * ( 1 + cos ( pi * d / s ))
+def AddBump(A,n,m):
+    # these are in floats, so there can be 'inbetween'-numbers.
+    
+    # BUGNOTE: m an n switched here?
+    # random point
+    x = random.uniform(0,m-1)
+    y = random.uniform(0,n-1)
+    # random size
+    s = random.uniform(0, (n+m)/10)
+    
+    #rather than empty, maybe copy the array instead?
+    increased_array = A
+    
+    # DEBUG prints
+    #print("The bounds of the terrain are: {} and {}".format(n, m))
+    #print("The dimension of the array are: {} and {}".format(len(A), len(A[0])))
+    #print("The coordinates of the bump are: {} and {}".format(x, y))
+    #print("The dimension of the new array are: {} and {}".format(len(increased_array), len(increased_array[0])))
+    
+    # for each point, bump the height, based on the distance.
+    # BUGNOTE: m an n switched here?
+        # x associated to i and therefore m, vice versa with j and n
+    for i in range(m):
+        for j in range(n):
+            # access each point in the given array like this
+            distance = math.sqrt((x - i) ** 2 + (y - j) ** 2)
+            increase =  (s / math.pi) * (1 + math.cos( (math.pi * distance) / s ))
+            
+            # Bump surrounding points (within distance d) up with given function from assignment 2.1
+            if (distance < s):
+                #print("Increased-point coordinates are: {} and {}".format(i, j))
+                increased_array[i][j] += increase
+    return increased_array
+    
+    
+# recursively add bumps, x times.
+def AddBumps(A,n,m,x):
+    # while x is positive, we have bumps to add. Recursively do so. Otherwise, return.
+    if (x > 0):
+        new = AddBump(A,n,m)
+        return AddBumps(new,n,m,x-1)
+    else:
+        return A
+   
+   
+def ErodeRandomPointNEW(A,n,m):
+    # BUGNOTE: m an n switched here?
+    x = random.randint(0,m-1)
+    y = random.randint(0,n-1)
+    
+    v = 1   #volume of the drop
+    s = 0   #sediment of the drop
+    
+    # do a check if we are on the edge. if so, return immediately.
+    # also, if z = 0, we stop, to prevent holes. ( Suggestion by Sander van Beurden on Teams in 2023)
+    # BUGNOTE: m an n switched here?
+    if y+1 >= n or y-1 < 0 or x+1 >= m or x-1 < 0 or A[x][y] <= 0:
+        return A
+    
+    # initial state of the output, that we will be editing as we erode.
+    # From here on, we don't use A.
+    output = A
+    
+    # While the drop still has volume larger than some threshold (say v>= 0.1), do:
+    t = 0.01    #volume threshold
+    v_loss_percentage = 0.05
+    p = (x,y)
+    q = FindLowestNeighbor(output,n,m,x,y)
+    while (v>=t):                
+        #If the lowest neighbour q is higher than p, then all neighbours of p are higher.
+        # This means that we are in a LOCAL MINIMA.
+        # In this case, we deposit all sediment into p and set volume to 0
+        px,py = p
+        qx,qy = q
+        
+        # if the lowest neighbour 'q' is higher than 'p'..
+        if (output[qx][qy] > output[px][py]):
+            new_p = output[px][py] + s
+            output[px][py] = new_p
+            s = 0   #all sediment deposited, set to 0
+            v = 0   #end of the drop, set to 0.
+            # we dont need to worry about adjusting px,py etc. because..
+            # we will exit the while-loop after this, and the following operations wont be reached.
+        else:
+            # Otherwise, increase sediment and set p and q to new points.
+            # Calculate amount of sediment we pick up 'a'. a <= s.
+            a = v * (output[qx][qy] + s - output[px][py])
+            if (a < s - v):
+                a = s - v
+                s = s - a
+                output[px,py] = output[px,py] + a
+               #either deposits or picks up sediment, depending on the sign of 'a'.
+            # Decrease volume of the drop by some percentage.   
+            v = (1-v_loss_percentage) * v
+            # Let p be q, and q be the lowest neighbour of our new q. 
+            # The drop will flow towards q.
+            p = q
+            q = FindLowestNeighbor(output, n, m, qx,qy)
+            
+    # after we exit the while-loop, we should have our definitive output-array with eroded points.
+    return output
+        
+def FindLowestNeighbor(A, n, m, x,y):
+    # Look at the 8 neighbors of p and find the lowest one, 'q'.
+    neighbors = FindNeighborPoints(x,y)
+    # we have an infinite value to check against so we can always find the
+    # point with the smallest height.
+    lowest = float('inf')
+    # (-1,-1) is a point that should always be overwritten by the lowest point.
+    q = (-1,-1)
+    # We find q.
+    for i in range(len(neighbors)):
+        x_, y_ = neighbors[i]
+        # Continue only if neighbour is within bounds of the array.
+        # BUGNOTE: m an n switched here?
+        if (0 <= x_ < n and 0 <= y_ < m):
+            neighbor_value = A[x_][y_]
+            if (neighbor_value < lowest):
+                lowest = neighbor_value
+                q = neighbors[i]
+    return q
+   
+def ErodeRandomPoint(A,n,m):    
+    # choose a random point p (x,y) within the range of the terrain
+    # since we want to find p's neighbors, x and y are ints.
+    
+    # BUGNOTE: m an n switched here?
+    x = random.randint(0,m-1)
+    y = random.randint(0,n-1)
+    
+    # do a check if we are on the edge. if so, return immediately.
+    # also, if z = 0, we stop, to prevent holes. ( Suggestion by Sander van Beurden on Teams in 2023)
+    # BUGNOTE: m an n switched here?
+    if y+1 >= n or y-1 < 0 or x+1 >= m or x-1 < 0 or A[x][y] <= 0:
+        return A
+    
+    output = A
+    
+    # Look at the 8 neighbors of p and find the lowest one, 'q'.
+    neighbors = FindNeighborPoints(x,y)
+    # we have an infinite value to check against so we can always find the
+    # point with the smallest height.
+    lowest = float('inf')
+    # (-1,-1) is a point that should always be overwritten by the lowest point.
+    q = (-1,-1)
+    # We find q.
+    for i in range(len(neighbors)):
+        x_, y_ = neighbors[i]
+        neighbor_value = A[x_][y_]
+        if (neighbor_value < lowest):
+            # We ignore neighbour-values of 0, so we get more interesting curves. ( Suggestion by Sander van Beurden on Teams)
+            if (neighbor_value > 0):
+                lowest = neighbor_value
+                q = neighbors[i]
+    
+    #If q is higher than p, we are in a LOCAL MINIMA.
+    # in this case, we exit the loop to prevent strange pits.
+    qx,qy = q
+    if (A[qx][qy] > A[x][y]):
+        output[qx][qy] = A[x][y]
+        return output
+     
+    #Lower q by a random amount
+    random_decrease = random.uniform(0,0.15)
+    
+    # the decrease should never be larger than their current height difference
+    height_diff = output[x,y] - output[qx,qy]
+    if random_decrease > height_diff:
+        random_decrease = height_diff
+    
+    output[qx][qy] -= random_decrease
+    
+    #Recurse this function on q, until we reach the edge of the terrain.
+    #recursion exit is upon entry of the function.
+    return ErodeRandomPoint(output,n,m)
+    
+
+
+def FindNeighborPoints(x,y):
+    #Find the input-points 8 neighbors
+    neighbors = []
+    
+    neighbors.append((x, y+1))
+    neighbors.append((x+1, y+1))
+    neighbors.append((x+1, y))
+    neighbors.append((x+1, y-1))
+    neighbors.append((x, y-1))
+    neighbors.append((x-1, y-1))
+    neighbors.append((x-1, y))
+    neighbors.append((x-1, y+1))
+    
+    return neighbors
+    
+    
+    
+# generates a horizontal slab spanning a  n x m  rectangle,
+# I chose to make a slab instead of a plane as it creates a more realistic body of water
+def WaterPlane(n,m):   
+    # Calculate water-height
+    height = random.uniform(0, (n + m)/20)
+    
+    # Ensure we are in the correct mode 
+    bpy.ops.object.mode_set(mode='OBJECT')
+    # Deselect all objects
+    bpy.ops.object.select_all(action='DESELECT')
+    
+    # Add a cube with default size
+    bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
+    cube = bpy.context.object
+    
+    # Scale the cube to match the desired dimensions
+    # BUGNOTE: m and n switched here?
+    cube.scale = (n / 2, m / 2, height / 2)
+    cube.location = (n/2, m/2, height / 2)
+    
+    # Create a new material
+    material = bpy.data.materials.new(name="Water")
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    for node in nodes:
+        nodes.remove(node)
+    output_node = nodes.new(type='ShaderNodeOutputMaterial')
+    principled_bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+    output_node.location = (400, 0)
+    principled_bsdf.location = (0, 0)
+    links = material.node_tree.links
+    links.new(principled_bsdf.outputs['BSDF'], output_node.inputs['Surface'])
+    principled_bsdf.inputs['Base Color'].default_value = (0.03, 0.09, 0.39, 1)  # RGBA
+    principled_bsdf.inputs['Alpha'].default_value = 0.95
+    material.blend_method = 'BLEND'    
+    cube.data.materials.append(material)
+    
+    return height
+
+# creates heightmap, adds some random bumps, performs some erosion, converts result to mesh
+# also adds a water plane.
+def GenerateTerrain(n,m):
+    # instantiates the plane, with no height
+    flat_array = ZeroHeights(n,m)
+
+    # adds bumps to the heighmap array
+    new_array = AddBumps(flat_array, n,m, (n+m)/4)
+    
+    # we scale the amount of erosions by the size of the terrain. 
+    # on average, each point in the terrain gets a chance to erode.
+    for i in range(n*m):
+        new_array = ErodeRandomPointNEW(new_array, n,m)
+
+    #converts heightmap to mesh
+    TerrainFromHeights(new_array, n, m)
+    
+    #makes a plane-mesh for the water. This returns the waterheight, too.
+    height = WaterPlane(n,m)
+    
+    # we return the array and height calculated here so we can pass it on to
+    # the 'addvegetation' function in GenerateTerrainWithVegetation    
+    return (new_array, height)
+    
+
+
+def AddVegetation(A,n,m,h):
+    # random amount based on fraction of total surface, 
+    # taking into account the water-level.
+    amount = random.randint(0, max(n,m)*4)
+    
+    largest_dimension = max(n,m)
+    trees = EmptyQuadTree(largest_dimension)
+    mushrooms = EmptyQuadTree(largest_dimension)
+    
+    #Generate the points for trees and mushrooms
+    for i in range(amount):
+        # the first generated third will be trees
+        # this way there will be 2 times as many mushroom.s
+        # now, there will be around 2 mushroom per tree.
+        if (amount - i > amount * 2/3): 
+            trees = GenerateTree(A, n, m, h, trees)
+        # the other half will be mushrooms. This way, we can pass the trees to the
+        # generation of mushrooms to find correct placements
+        else:
+            mushrooms = GenerateMushroom(A, n, m, h, trees, mushrooms)
+            
+    # Call the ShowTree/ShowMushroom recurisvely over the quadtrees
+    OperateOnQuadtree(trees, ShowTreeOnQuadtree, A, n, m)
+    OperateOnQuadtree(mushrooms, ShowShroomOnQuadtree, A, n, m)
+    
+    
+
+def GenerateTerrainWithVegetation(n,m):
+    array, height = GenerateTerrain(n,m)
+    AddVegetation(array,n,m,height)
+
+
+# checks constraints of trees
+# cannot be above the treeline (1000)
+# cannot be below water (h)
+# cannot be within radius of other tree (check against all members of T
+def TreePossible(A,p,h,T):
+    px, py = p
+    
+    #find the height of the tree
+    # we round the location down to find a representative height for the point.
+    # we do want floats later on to define the precise points.
+    tree_height = A[round(px)][round(py)]
+    
+    closest_tree = ClosestPoint(T,px,py)
+    if (closest_tree == None):
+        distance = float('inf')
+    else:
+        qx, qy = ClosestPoint(T,px,py)
+        q_height = A[round(qx)][round(qy)]
+        distance = math.sqrt((px - qx) ** 2 + (py - qy) ** 2 + (tree_height - q_height) ** 2)
+    
+    if tree_height <= h or tree_height > 1000 or distance <= 10:
+        return False
+    # if the tree survives the gauntlet, return True
+    else:
+        return True
+ 
+ 
+        
+def MushroomPossible(A,p,h,T,M):
+    px, py = p
+    
+    #find the height of the tree
+    # we round the location down to find a representative height for the point.
+    # we do want floats later on to define the precise points.
+    mushroom_height = A[round(px)][round(py)]
+    
+    closest_shroom = ClosestPoint(M,px,py)
+    if (closest_shroom == None):
+        distance_m = float('inf')
+    else:
+        mx, my = closest_shroom
+        m_height = A[round(mx)][round(my)]
+        distance_m = math.sqrt((px - mx) ** 2 + (py - my) ** 2 + (mushroom_height - m_height) ** 2)
+    closest_tree = ClosestPoint(T,px,py)
+    if (closest_tree == None):
+        distance_t = float('inf')
+    else:
+        tx, ty = closest_tree
+        t_height = A[round(tx)][round(ty)]
+        distance_t = math.sqrt((px - tx) ** 2 + (py - ty) ** 2 + (mushroom_height - t_height) ** 2)
+    
+    # We return false if..
+    ## the point is under water level                                   OR
+    ## the point is above the tree-line                                 OR
+    ## the point is within 0.1 meters of another mushroom               OR
+    ## the point is within 0.01 meters of a tree                        OR
+    ## the point is further than 2 meters from the closest tree   
+    if mushroom_height <= h or mushroom_height > 1000 or distance_m <= 0.1:
+        return False
+    else:
+        # I doubled the range at which a mushroom can spawn from a tree (4)
+        # this way it is easier visible that they only spawn near trees
+        if distance_t > 0.01 and distance_t <= 4:
+            return True
+        else:
+            return False
+
+# takes heightmap A with dimensions  n x m
+# takes water-level h
+# takes list of previously-planted trees T
+# Generates a random tree at a location that satisfies all constraints thus far.
+def GenerateTree(A,n,m,h,T):
+    trees = T
+    max_tries = 500
+    tries = 0
+    found_tree = False
+    
+    p = (0,0)
+    # if it does not satisfy the constraints, discard and try again.
+    # only try again X number of times.
+    while(not found_tree and max_tries >= tries):
+        # generate a new point and increment the number of tries
+        x = random.uniform(0,m-1)
+        y = random.uniform(0,n-1)
+        p = (x,y)
+        found_tree = TreePossible(A,p,h,T)
+        tries += 1
+        
+    # could not find a new tree withing the set number of tries
+    if not found_tree and tries >= max_tries:
+        return T
+    
+    # otherwise we must have found a suitable spot.
+    InsertPoint(trees, x, y)
+    return trees
+    
+
+def GenerateMushroom(A,n,m,h,T,M):
+    mushrooms = M
+    max_tries = (n + m) * 2 
+    tries = 0
+    found_mushroom = False
+    # if it does not satisfy the constraints, discard and try again.
+    # only try again X number of times.
+    while(not found_mushroom and max_tries >= tries):
+        #generate a new point and increment the number of tries
+        x = random.uniform(0,m-1)
+        y = random.uniform(0,n-1)
+        found_mushroom = MushroomPossible(A,(x,y),h,T,M)
+        tries += 1
+        
+    # could not find a new tree withing the set number of tries
+    if tries >= max_tries:
+        return M
+    
+    # if we did not exceed the number of tries, we mustve found a suitable spot.
+    #mushrooms = M
+    #mushrooms.append((x,y))
+    InsertPoint(mushrooms,x,y)
+    return mushrooms
+
+
+def ShowTree(A,n,m,x,y):
+    # Apply the transformations of the original tree to clear any rotation or scaling
+    bpy.context.view_layer.objects.active = tree_to_copy
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+
+    # Create a new object based on the tree mesh
+    new_tree = bpy.data.objects.new("NewTree", tree_to_copy.data.copy())
+    
+    # Link the new object to the scene collection
+    bpy.context.collection.objects.link(new_tree)
+
+    # Set the rotation and scale to be the same as the original,
+    # so thay they are not rotated and scaled.
+    new_tree.rotation_euler = tree_to_copy.rotation_euler
+    new_tree.scale = tree_to_copy.scale
+    
+    # Set the new object as the active object
+    bpy.context.view_layer.objects.active = new_tree
+
+    # Set position
+    z = A[round(x)][round(y)] + 10
+    new_tree.location = mathutils.Vector((x, y, z))
+    
+def ShowMushroom(A,n,m,x,y):
+    # Apply the transformations of the original tree to clear any rotation or scaling
+    bpy.context.view_layer.objects.active = shroom_to_copy
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+
+    # Create a new object based on the tree mesh
+    new_shroom = bpy.data.objects.new("NewShroom", shroom_to_copy.data.copy())
+    
+    # Link the new object to the scene collection
+    bpy.context.collection.objects.link(new_shroom)
+
+    # Set the rotation and scale to be the same as the original,
+    # so thay they are not rotated and scaled.
+    new_shroom.rotation_euler = shroom_to_copy.rotation_euler
+    new_shroom.scale = shroom_to_copy.scale
+    
+    # Set the new object as the active object
+    bpy.context.view_layer.objects.active = new_shroom
+
+    # Set position
+    z = A[round(x)][round(y)]
+    new_shroom.location = mathutils.Vector((x, y, z))
+    
+
+def OriginalTree():
+    # 'C:/Users/siwer/Documents/Uni/UU 3DM/Tutorials_2024/tutorial2/pointclouds/cat_POINTS.off'
+    # Create path and import tree
+    bpy.ops.import_scene.fbx(filepath='C:/Users/siwer/Documents/Uni/UU 3DM/Tutorials_2024/tutorial4/models/tree.fbx')
+    
+    # Import texture
+    material = bpy.data.materials.new('TreeMaterial')
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    for node in nodes:
+        nodes.remove(node)
+    output_node = nodes.new(type='ShaderNodeOutputMaterial')
+    principled_bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+    texture_node = nodes.new(type='ShaderNodeTexImage')
+    image = bpy.data.images.load('C:/Users/siwer/Documents/Uni/UU 3DM/Tutorials_2024/tutorial4/models/tree.png')
+    texture_node.image = image
+    links = material.node_tree.links
+    links.new(texture_node.outputs['Color'], principled_bsdf.inputs['Base Color'])
+    links.new(principled_bsdf.outputs['BSDF'], output_node.inputs['Surface'])
+    
+    object = bpy.context.collection.objects[-1]
+    
+    # append texture
+    if object.data.materials:
+        object.data.materials[0] = material
+    else:
+        object.data.materials.append(material)
+    return object
+
+
+def OriginalShroom():
+    # Create path and import shroom
+    bpy.ops.import_scene.fbx(filepath='C:/Users/siwer/Documents/Uni/UU 3DM/Tutorials_2024/tutorial4/models/schroom.fbx')
+    
+    # Import texture
+    material = bpy.data.materials.new('SchroomMaterial')
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    for node in nodes:
+        nodes.remove(node)
+    output_node = nodes.new(type='ShaderNodeOutputMaterial')
+    principled_bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+    texture_node = nodes.new(type='ShaderNodeTexImage')
+    image = bpy.data.images.load('C:/Users/siwer/Documents/Uni/UU 3DM/Tutorials_2024/tutorial4/models/schroom.png')
+    texture_node.image = image
+    links = material.node_tree.links
+    links.new(texture_node.outputs['Color'], principled_bsdf.inputs['Base Color'])
+    links.new(principled_bsdf.outputs['BSDF'], output_node.inputs['Surface'])
+    
+    object = bpy.context.collection.objects[-1]
+    
+    # append texture
+    if object.data.materials:
+        object.data.materials[0] = material
+    else:
+        object.data.materials.append(material)
+    return object
+    
+
+
+class quadtree_cell:
+    def __init__(self, square, points_array=None, parent=None, children_array=None):
+        self.square = square
+        self.points_array = points_array if points_array is not None else []
+        self.parent = parent
+        self.children_array = children_array if children_array is not None else []
+    
+    def is_leaf(self):
+        return len(self.children_array) == 0
+    
+    def has_points(self):
+        return self.points_array != None and len(self.points_array) > 0
+    
+# the value of 'n' will be the maximum of n and m (the size of our field)
+# it needs to be squared, but also encompass the entire terrain
+def EmptyQuadTree(n):
+    root_square = (0, 0, n, n)
+    return quadtree_cell(root_square)
+
+# takes the root quadtree_cell 'C'
+# and a quarry point (x,y)
+# Returns the quadtree_cell which the point would fit into.
+def FindLeafCell(C,x,y):
+    # Check if C is already subdivided (if the array of children is non-empty)
+    if C.children_array != None:
+        for i in range(len(C.children_array)):
+            #pattern matching on the square to obtain its bounds
+            xmin, ymin, xmax, ymax = C.children_array[i].square
+            #if it falls under these conditions, the point is within this square.
+            if xmin <= x <= xmax and ymin <= y <= ymax:
+                #we return the result of recursion on this child
+                return FindLeafCell(C.children_array[i], x, y)
+        # If the point isnt contained by any of its children, it is not within the quadtree.
+        # Then, we return....?
+        else:
+            return C
+    else:
+        return C
+    
+def InsertPoint(C, x, y):
+    # Check if C is a leaf cell.
+    if C.is_leaf():
+        # is a leaf..
+        # Check if it contains any points
+        if C.has_points():
+            # is not empty..
+            C.points_array.append((x,y))
+            #Check now if it contains too many points
+            if len(C.points_array) > k:
+                # Create four new quadtree_cells with squares that correspond to
+                # the four quarters of the square of C.
+                xmin, ymin, xmax, ymax = C.square
+                xmid = (xmax - xmin) / 2
+                ymid = (ymax - ymin) / 2
+                child_1 = quadtree_cell(square = (xmin, ymin, xmid, ymid), parent = C)
+                child_2 = quadtree_cell(square = (xmid, ymin, xmax, ymid), parent = C)
+                child_3 = quadtree_cell(square = (xmin, ymid, xmid, ymax), parent = C)
+                child_4 = quadtree_cell(square = (xmid, ymid, xmax, ymax), parent = C)
+                C.children_array.extend([child_1, child_2, child_3, child_4])
+                
+                # then, for all points in the array of C, check in which child quadcell they are.
+                for i in range(len(C.points_array)):
+                    px, py = C.points_array[i]
+                    # Fetch the best child-cell to put the point in, and then insert it.
+                    InsertPoint(FindLeafCell(C,px,py), px, py)
+                
+                #Lastly, remove the points_array from C
+                C.points_array = None
+                
+            # else, no action is needed.
+        else:
+            # is empty..
+            #Create a new array and insert the point (x,y)
+            C.points_array = [(x,y)]
+    else:
+        # if not..
+        # Call FindLeafCell(C,x,y) and insert (x,y) into the returning leaf cell instead
+        FindLeafCell(C,x,y).points_array.append((x,y))
+
+def ClosestPoint(C,x,y):
+    # Find leaf cell that contains (x,y)
+    containing_cell = FindLeafCell(C,x,y)
+    # If this cell has points, take any point in the array. This will be our initial guess.
+    if containing_cell.has_points():
+        return random.choice(containing_cell.points_array)
+    else:
+        # if it doesnt have a parent..
+        if containing_cell.parent == None:
+            # the quadtree is empty, we return null
+            return None
+        # it does have a parent..
+        else:
+            # the cell's parent must have another child with point in it
+            # (otherwise it would not have been split)
+            # Search the tree rooted at the cell's parent.. until you find a point
+            return FindAnyPoint(containing_cell.parent)
+            
+            
+def FindAnyPoint(C):
+    # we choose a random point from the list
+    if C.has_points():
+        return random.choice(C.points_array)
+    # else, for every child of this cell, 
+    else:
+        for child in C.children_array:  # Traverse the children
+            point = FindAnyPoint(child)
+            if point:  # If points are found in any child, return them
+                return point
+    # there is no other base case because we know there must be some other point in this branch
+
+# Takes a quadtree_cell             C
+#...    a candidate closest point   p
+#.. and a query point               q
+# Returns the closest point in the whole quadtree to q
+def PruneAndSearch(C,p,q):
+    # helper function to determine the distances between the points within this function
+    def distance_(p1,p2):
+        p1x,p1y = p1
+        p2x,p2y = p2
+        return (math.sqrt((p1x - p2x) ** 2 + (p1y - p2y) ** 2))
+    
+    # Check if the closest corner of the square of C is closer to q than p is.
+    c1,c2,c3,c4 = C.square
+    closest_corner = min([distance_(c1,q), distance_(c2,q), distance_(c3,q), distance_(c4,q)])
+    if distance_(closest_corner,q) < distance_(p,q):
+        if C.is_leaf():
+            # find the closest point to q in this cell by checking all of them.
+            distances = []
+            for point in C.points_array:
+                distances.append(distance_(point,q))
+            # if there is some point closer to q than p, return that point.
+            if min(distances) < p:
+                # we find the index of the smallest distance and fill it into the points_array
+                # to get the point in question, so that we can return it
+                return C.points_array[distances.index(min(distances))]
+            # otherwise, return p.
+            else:
+                return p
+        # C is not a leaf..
+        else:
+            closest_points = []
+            # recursively search for the closest point in all of C's children
+            for child in C.children_array:
+                closest_points.append(PruneAndSearch(child, p, q))
+            # return the closest point of all closest points found
+            return min(closest_points)
+    else:
+        return p
+    
+    
+def OperateOnQuadtree(C, f, A, n ,m):
+    # If this cell has no children, operate on its points, if any.
+    if C.has_points():
+        f(C, A, n, m)
+    # if it does have children, 
+    else:
+        # recursively call the operation f on each child
+        for child in C.children_array:
+            OperateOnQuadtree(child, f, A, n, m)  # Recursively operate on child quadtree cells
+
+def ShowTreeOnQuadtree(C, A, n ,m):
+    for point in C.points_array:
+        x, y = point  # Get the (x, y) coordinates from the quadtree cell's point array
+        ShowTree(A, n, m, x, y)  # Call your ShowTree function with the coordinates
+        
+def ShowShroomOnQuadtree(C, A, n ,m):
+    for point in C.points_array:    
+        x, y = point  # Get the (x, y) coordinates from the quadtree cell's point array
+        ShowMushroom(A, n, m, x, y)  # Call your ShowTree function with the coordinates    
+
+
+
+
+
+
+def DisplayQuadTree():
+    pass
+
+def count_points_in_quadtree(quadtree):
+    count = 0
+    
+    if (quadtree.has_points()):
+        count = len(quadtree.points_array)  # Get the number of points in the current quadtree cell
+
+    if (not quadtree.children_array is None):
+        for child in quadtree.children_array:
+            count += count_points_in_quadtree(child)  # Recursively count points in child quadtree cells
+
+    return count
+
+
+
+
+
+
+'''
+Create texture from heightmap
+'''
+def HeightToColor(height, waterHeight, treeLine):
+    
+    fraction = 1
+    
+    if (height <= waterHeight):
+        fraction = 0
+    else:
+        fraction = height / (treeLine - waterHeight)
+    
+    # Map normalized value to color
+    # Dark brown to white mapping
+    dark_brown = np.array([50, 33, 16]) / 255.0  # Dark brown RGB
+    white = np.array([1, 1, 1])  # White RGB
+
+    # Interpolate between dark brown and white
+    color = (white - dark_brown) * fraction + dark_brown
+    
+    color = np.clip(color,0,1)
+    return tuple((color * 255).astype(int))
+
+def HeightmapToColormap(A,n,m,waterHeight,treeLine):
+    # Normalize grid values
+    #T = np.vectorize(lambda h: HeightToColor(h,waterHeight,treeLine))
+    T = np.array([[HeightToColor(i,waterHeight,treeLine) for i in row]for row in A])
+    return T
+            
+
+# Capital T for texture
+def CreateImage(A,n,m):
+    pil_image = Image.new('RGB', (n,m))
+    
+    max = np.amax(A)
+    print('Max height: ', max)
+    
+    T = HeightmapToColormap(A,n,m,0,max + max/2)
+    
+    # Populate the image with colors based on the grid values
+    for i in range(m):
+        for j in range(n):
+            color = T[i][j]
+            pil_image.putpixel((j, i), (color[0],color[1],color[2],255))
+    
+    # create new image
+    #pil_image = pil_image.rotate(-90)
+    bpy_image = bpy.data.images.new('TextureImage', width=pil_image.width, height=pil_image.width)
+
+    # convert Image 'L' to 'RGBA', normalize then flatten 
+    bpy_image.pixels[:] = (np.asarray(pil_image.convert('RGBA'),dtype=np.float32) * (1.0 / 255.0)).ravel()
+
+    pil_image.save('C:/Users/siwer/Documents/Uni/UU 3DM/Tutorials_2024/tutorial4/models/terrain.png')
+    
+    return bpy_image
+
+
+
+
+
+
+
+tree_to_copy = OriginalTree()
+shroom_to_copy = OriginalShroom()
+
+'''
+Currently when n != m, we get index errors.. we need to fix this.
+This is likely due to a mix up between x and y / n and m / i and j values
+But this bug is currently too deeply rooted that I was not able to solve it.
+'''
+#dimensions of the terrain
+n_ = 200
+m_ = n_
+#m_ = 150
+
+#number of points allowed per quadcell
+k = 10
+
+GenerateTerrainWithVegetation(n_,m_)
+
+
+
+
+#This deletes the objects made for duplication.
+def CleanScene():
+    bpy.data.objects.remove(bpy.data.objects['Plane.037'])
+    bpy.data.objects.remove(bpy.data.objects['Circle'])
+    
+CleanScene()
